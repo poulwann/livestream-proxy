@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
@@ -121,28 +122,62 @@ func (sp *StreamProxy) StartStreaming(streamURL, cookieFile string) error {
 	sp.isRunning = true
 	sp.mu.Unlock()
 	fmt.Println(streamURL)
+
 	cmd := exec.CommandContext(sp.ctx, "yt-dlp",
 		"--cookies", cookieFile,
 		"--get-url",
 		streamURL)
 	fmt.Println(cmd)
 	output, err := cmd.Output()
+
 	if err != nil {
-		sp.mu.Lock()
-		sp.isRunning = false
-		sp.mu.Unlock()
-		return fmt.Errorf("failed to get stream URL: %v", err)
+		log.Printf("Failed to get direct URL, trying DASH method: %v", err)
+		go sp.streamFromURL(streamURL, cookieFile, true) // Force DASH mode
+		return nil
 	}
 
-	actualURL := string(output[:len(output)-1])
-	log.Printf("Got actual stream URL: %s", actualURL)
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 0 {
+		log.Printf("No URL returned, trying DASH method")
+		go sp.streamFromURL(streamURL, cookieFile, true) // Force DASH mode
+		return nil
+	}
 
-	go sp.streamFromURL(actualURL, cookieFile)
+	actualURL := lines[0]
+	log.Printf("Got actual stream URL: %s", actualURL)
+	log.Printf("============================")
+
+	isDash := strings.Contains(actualURL, "manifest/dash") ||
+		strings.Contains(actualURL, ".mpd") ||
+		strings.Contains(actualURL, "/dash/")
+
+	isHLS := strings.Contains(actualURL, ".m3u8") ||
+		strings.Contains(actualURL, "/hls/") ||
+		strings.Contains(actualURL, "playlist.m3u8")
+
+	isDirectVideo := strings.Contains(actualURL, ".mp4") ||
+		strings.Contains(actualURL, ".mkv") ||
+		strings.Contains(actualURL, ".avi") ||
+		strings.Contains(actualURL, ".webm") ||
+		strings.Contains(actualURL, ".flv")
+
+	if isHLS || isDirectVideo {
+		isDash = false
+		if isHLS {
+			log.Printf("Detected HLS stream, using regular FFmpeg method")
+		} else {
+			log.Printf("Detected direct video file, using regular FFmpeg method")
+		}
+	}
+
+	log.Printf("Stream type detection - DASH: %t, HLS: %t, Direct: %t", isDash, isHLS, isDirectVideo)
+
+	go sp.streamFromURL(actualURL, cookieFile, isDash)
 
 	return nil
 }
 
-func (sp *StreamProxy) streamFromURL(url, cookieFile string) {
+func (sp *StreamProxy) streamFromURL(url, cookieFile string, isDash bool) {
 	defer func() {
 		sp.mu.Lock()
 		sp.isRunning = false
@@ -150,7 +185,7 @@ func (sp *StreamProxy) streamFromURL(url, cookieFile string) {
 		log.Println("Stream processing stopped")
 	}()
 
-	log.Printf("Starting stream processing from URL: %s", url)
+	log.Printf("Starting stream processing from URL: %s (DASH: %t)", url, isDash)
 
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		log.Printf("FFmpeg not found in PATH: %v", err)
@@ -170,7 +205,21 @@ func (sp *StreamProxy) streamFromURL(url, cookieFile string) {
 
 		log.Printf("Stream attempt %d/%d", attempt, maxRetries)
 
-		if sp.runFFmpegStream(url, attempt) {
+		var success bool
+		if isDash {
+			success = sp.runFFmpegStreamDash(url, cookieFile, attempt)
+		} else {
+			success = sp.runFFmpegStream(url, attempt)
+
+			if !success {
+				if strings.Contains(url, "manifest/dash") || strings.Contains(url, ".mpd") || strings.Contains(url, "/dash/") {
+					log.Printf("Regular method failed for potential DASH URL, trying DASH method as fallback")
+					success = sp.runFFmpegStreamDash(url, cookieFile, attempt)
+				}
+			}
+		}
+
+		if success {
 			log.Printf("Stream ended, attempting restart in %v", retryDelay)
 			time.Sleep(retryDelay)
 			retryDelay = time.Duration(float64(retryDelay) * 1.5)
@@ -314,6 +363,162 @@ func (sp *StreamProxy) runFFmpegStream(url string, attempt int) bool {
 	}
 
 	log.Printf("FFmpeg process ended normally on attempt %d", attempt)
+	return true
+}
+
+func (sp *StreamProxy) runFFmpegStreamDash(url, cookieFile string, attempt int) bool {
+
+	ytdlpArgs := []string{
+		"--cookies", cookieFile,
+		"--format", "best[height<=720]/best",
+		"--output", "-",
+		url,
+	}
+
+	ffmpegArgs := []string{
+		"-re",
+		"-loglevel", "warning",
+		"-i", "pipe:0",
+		"-c", "copy",
+		"-f", "mpegts",
+		"-avoid_negative_ts", "make_zero",
+		"-fflags", "+genpts+flush_packets",
+		"-flush_packets", "1",
+		"-max_delay", "500000",
+		"-",
+	}
+
+	log.Printf("Running DASH pipeline attempt %d: yt-dlp -> ffmpeg", attempt)
+	log.Printf("yt-dlp args: %v", ytdlpArgs)
+	log.Printf("ffmpeg args: %v", ffmpegArgs)
+
+	ytdlpCmd := exec.CommandContext(sp.ctx, "yt-dlp", ytdlpArgs...)
+	ffmpegCmd := exec.CommandContext(sp.ctx, "ffmpeg", ffmpegArgs...)
+
+	ytdlpStdout, err := ytdlpCmd.StdoutPipe()
+	if err != nil {
+		log.Printf("Failed to create yt-dlp stdout pipe: %v", err)
+		return false
+	}
+
+	ffmpegCmd.Stdin = ytdlpStdout
+
+	ffmpegStdout, err := ffmpegCmd.StdoutPipe()
+	if err != nil {
+		log.Printf("Failed to create ffmpeg stdout pipe: %v", err)
+		return false
+	}
+
+	ffmpegStderr, err := ffmpegCmd.StderrPipe()
+	if err != nil {
+		log.Printf("Failed to create ffmpeg stderr pipe: %v", err)
+		return false
+	}
+
+	go func() {
+		scanner := bufio.NewScanner(ffmpegStderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line != "" {
+				log.Printf("FFmpeg-DASH[%d]: %s", attempt, line)
+			}
+		}
+	}()
+
+	if err := ytdlpCmd.Start(); err != nil {
+		log.Printf("Failed to start yt-dlp: %v", err)
+		return false
+	}
+
+	if err := ffmpegCmd.Start(); err != nil {
+		log.Printf("Failed to start ffmpeg: %v", err)
+		ytdlpCmd.Process.Kill()
+		return false
+	}
+
+	log.Printf("Started DASH pipeline: yt-dlp (PID: %d) -> ffmpeg (PID: %d) (attempt %d)",
+		ytdlpCmd.Process.Pid, ffmpegCmd.Process.Pid, attempt)
+
+	reader := bufio.NewReaderSize(ffmpegStdout, 128*1024)
+	buffer := make([]byte, 64*1024)
+	headerSent := false
+	totalBytes := 0
+	lastLogTime := time.Now()
+	lastDataTime := time.Now()
+	noDataTimeout := 30 * time.Second
+
+	log.Printf("Starting to read from FFmpeg stdout (DASH attempt %d)...", attempt)
+
+	for {
+		select {
+		case <-sp.ctx.Done():
+			log.Println("Context cancelled, stopping DASH stream")
+			if ytdlpCmd.Process != nil {
+				ytdlpCmd.Process.Kill()
+			}
+			if ffmpegCmd.Process != nil {
+				ffmpegCmd.Process.Kill()
+			}
+			return false
+		default:
+		}
+
+		n, err := reader.Read(buffer)
+
+		if err != nil {
+			if err == io.EOF {
+				log.Printf("DASH stream ended (EOF) on attempt %d", attempt)
+				break
+			} else {
+				if time.Since(lastDataTime) > noDataTimeout {
+					log.Printf("DASH no data timeout reached on attempt %d", attempt)
+					break
+				}
+				log.Printf("Error reading DASH stream on attempt %d: %v", attempt, err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		}
+
+		if n > 0 {
+			lastDataTime = time.Now()
+			totalBytes += n
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+
+			if !headerSent {
+				log.Printf("Got first DASH data chunk of %d bytes on attempt %d - sending as header", n, attempt)
+				sp.broadcast(data, true)
+				headerSent = true
+			} else {
+				sp.broadcast(data, false)
+			}
+
+			now := time.Now()
+			if now.Sub(lastLogTime) > 10*time.Second {
+				sp.mu.RLock()
+				clientCount := len(sp.clients)
+				sp.mu.RUnlock()
+				log.Printf("DASH attempt %d: Read %d bytes (total: %d), %d clients connected", attempt, n, totalBytes, clientCount)
+				lastLogTime = now
+			}
+		}
+	}
+
+	log.Printf("DASH stream processing completed on attempt %d, total bytes: %d", attempt, totalBytes)
+
+	ytdlpCmd.Wait()
+	if err := ffmpegCmd.Wait(); err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			exitCode := exitError.ExitCode()
+			log.Printf("FFmpeg DASH process ended with exit code %d on attempt %d", exitCode, attempt)
+			return exitCode <= 1
+		}
+		log.Printf("FFmpeg DASH process ended with error on attempt %d: %v", attempt, err)
+		return true
+	}
+
+	log.Printf("DASH pipeline ended normally on attempt %d", attempt)
 	return true
 }
 
