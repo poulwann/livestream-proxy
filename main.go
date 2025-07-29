@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -123,10 +124,14 @@ func (sp *StreamProxy) StartStreaming(streamURL, cookieFile string) error {
 	sp.mu.Unlock()
 	fmt.Println(streamURL)
 
-	cmd := exec.CommandContext(sp.ctx, "yt-dlp",
-		"--cookies", cookieFile,
-		"--get-url",
-		streamURL)
+	// Build yt-dlp command with optional cookie file
+	args := []string{"--get-url"}
+	if cookieFile != "" {
+		args = append(args, "--cookies", cookieFile)
+	}
+	args = append(args, streamURL)
+
+	cmd := exec.CommandContext(sp.ctx, "yt-dlp", args...)
 	fmt.Println(cmd)
 	output, err := cmd.Output()
 
@@ -367,13 +372,14 @@ func (sp *StreamProxy) runFFmpegStream(url string, attempt int) bool {
 }
 
 func (sp *StreamProxy) runFFmpegStreamDash(url, cookieFile string, attempt int) bool {
-
-	ytdlpArgs := []string{
-		"--cookies", cookieFile,
-		"--format", "best[height<=720]/best",
-		"--output", "-",
-		url,
+	// Build yt-dlp args with optional cookie file
+	ytdlpArgs := []string{}
+	if cookieFile != "" {
+		ytdlpArgs = append(ytdlpArgs, "--cookies", cookieFile)
 	}
+	ytdlpArgs = append(ytdlpArgs,
+		"--output", "-",
+		url)
 
 	ffmpegArgs := []string{
 		"-re",
@@ -714,20 +720,38 @@ func (sp *StreamProxy) serveStreamHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	if len(os.Args) < 3 {
-		log.Fatal("Usage: go run main.go <stream_url> <cookie_file> [port]")
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: go run main.go <stream_url> [cookie_file] [port]")
 	}
 
 	streamURL := os.Args[1]
-	cookieFile := os.Args[2]
+	cookieFile := ""
 	port := "8080"
 
-	if len(os.Args) > 3 {
-		port = os.Args[3]
+	// Parse optional arguments
+	if len(os.Args) > 2 {
+		// Check if second argument is a port number or cookie file
+		secondArg := os.Args[2]
+		if _, err := strconv.Atoi(secondArg); err == nil {
+			// It's a port number
+			port = secondArg
+		} else {
+			// It's a cookie file
+			cookieFile = secondArg
+			if len(os.Args) > 3 {
+				port = os.Args[3]
+			}
+		}
 	}
 
-	if _, err := os.Stat(cookieFile); os.IsNotExist(err) {
-		log.Fatalf("Cookie file does not exist: %s", cookieFile)
+	// Validate cookie file if provided
+	if cookieFile != "" {
+		if _, err := os.Stat(cookieFile); os.IsNotExist(err) {
+			log.Fatalf("Cookie file does not exist: %s", cookieFile)
+		}
+		log.Printf("Using cookie file: %s", cookieFile)
+	} else {
+		log.Printf("No cookie file provided - proceeding without authentication")
 	}
 
 	proxy := NewStreamProxy(10)
