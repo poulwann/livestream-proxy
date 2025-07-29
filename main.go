@@ -120,13 +120,12 @@ func (sp *StreamProxy) StartStreaming(streamURL, cookieFile string) error {
 	}
 	sp.isRunning = true
 	sp.mu.Unlock()
-
+	fmt.Println(streamURL)
 	cmd := exec.CommandContext(sp.ctx, "yt-dlp",
 		"--cookies", cookieFile,
 		"--get-url",
-		"--format", "best[ext=mp4]/best",
 		streamURL)
-
+	fmt.Println(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		sp.mu.Lock()
